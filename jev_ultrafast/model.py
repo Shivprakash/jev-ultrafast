@@ -1,33 +1,89 @@
-"""TypeSafe makes choices; an optional small OpenAI-compatible model writes field values."""
+"""TypeSafe/Jev makes choices; an optional small OpenAI-compatible model writes field values.
+
+Backends (JEV_BACKEND):
+  typesafe  — https://api.typesafe.ai/v1/systemone (TYPESAFE_API_KEY)
+  openrouter — OpenRouter Decisions API (OPENROUTER_API_KEY)
+  vercel — Vercel AI Gateway evaluation model (AI_GATEWAY_API_KEY)
+
+Machine kill switch: ~/.config/lm/jev/browser.json enabled flag, or
+JEV_ULTRAFAST_ENABLED=0|1. Managed by `lm fleet jev-browser on|off`.
+"""
 
 import json
 import math
 import os
 import time
+from pathlib import Path
 
 import httpx
 
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+BROWSER_STATE_PATH = Path.home() / ".config" / "lm" / "jev" / "browser.json"
 
 
-def post_json(url, key, body):
+def assert_enabled():
+    """Raise if the machine-level Jev browser agent switch is off.
+
+    Precedence:
+      1. ~/.config/lm/jev/browser.json `enabled` when the file exists
+      2. else JEV_ULTRAFAST_ENABLED env (0/1)
+      3. else allow (dev default)
+    """
+    if BROWSER_STATE_PATH.is_file():
+        try:
+            data = json.loads(BROWSER_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if data.get("enabled") is False:
+            raise RuntimeError(
+                "Jev Ultrafast is OFF (lm fleet jev-browser). Enable with: lm fleet jev-browser on"
+            )
+        if data.get("enabled") is True:
+            return
+    env = os.environ.get("JEV_ULTRAFAST_ENABLED", "").strip().lower()
+    if env in {"0", "false", "off", "no"}:
+        raise RuntimeError(
+            "Jev Ultrafast is OFF (JEV_ULTRAFAST_ENABLED). Enable with: lm fleet jev-browser on"
+        )
+
+
+def post_json(url, key, body, extra_headers=None):
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+            detail = (response.text or "")[:300].replace("\n", " ")
+            raise RuntimeError(
+                f"Model provider returned HTTP {response.status_code}: {detail}; no action executed."
+            )
         return response.json()
     raise RuntimeError("Model unavailable")
 
 
+def normalize_choice_answer(answer):
+    """Fill confidence when a backend omits it (e.g. some gateway paths)."""
+    if not isinstance(answer, dict):
+        return answer
+    out = dict(answer)
+    probs = out.get("probabilities") or {}
+    if out.get("confidence") is None and isinstance(probs, dict) and probs:
+        values = [v for v in probs.values() if isinstance(v, (int, float))]
+        out["confidence"] = max(values) if values else 0.0
+    return out
+
+
 def validate_choice(answer, ids):
+    answer = normalize_choice_answer(answer)
     try:
         probabilities = answer["probabilities"]
         numbers = [*probabilities.values(), answer["confidence"]]
@@ -43,6 +99,96 @@ def validate_choice(answer, ids):
     if not valid:
         raise ValueError("Invalid TypeSafe response; no action executed.")
     return answer
+
+
+def resolve_backend():
+    """Pick Jev backend from env, defaulting to whatever key is present.
+
+    Prefer OpenRouter when both Vercel and OpenRouter keys exist: Vercel AI
+    Gateway may require billing verification even with a valid API key.
+    """
+    explicit = os.environ.get("JEV_BACKEND", "").strip().lower()
+    if explicit in {"typesafe", "openrouter", "vercel"}:
+        return explicit
+    if os.environ.get("TYPESAFE_API_KEY", "").strip():
+        return "typesafe"
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return "openrouter"
+    if os.environ.get("AI_GATEWAY_API_KEY", "").strip():
+        return "vercel"
+    return "typesafe"
+
+
+def jev_decide(body):
+    """POST the System One / Decisions payload to the configured backend."""
+    backend = resolve_backend()
+    if backend == "openrouter":
+        key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("OPENROUTER_API_KEY required for JEV_BACKEND=openrouter")
+        payload = {
+            **body,
+            "model": os.environ.get("TYPESAFE_MODEL", os.environ.get("JEV_MODEL", "~typesafe/jev-latest")),
+        }
+        result = post_json(
+            "https://openrouter.ai/api/alpha/decisions",
+            key,
+            payload,
+            extra_headers={
+                "HTTP-Referer": "https://github.com/browser-use/jev-ultrafast",
+                "X-OpenRouter-Title": "jev-ultrafast",
+            },
+        )
+        if "model" not in result:
+            result = {**result, "model": payload["model"]}
+        return result, backend
+
+    if backend == "vercel":
+        key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("AI_GATEWAY_API_KEY required for JEV_BACKEND=vercel")
+        base = os.environ.get("AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh/v4/ai").rstrip("/")
+        model = os.environ.get("TYPESAFE_MODEL", os.environ.get("JEV_MODEL", "typesafe-ai/jev"))
+        # Evaluation API: state + questions only; model via header.
+        payload = {"state": body["state"], "questions": body["questions"]}
+        result = post_json(
+            f"{base}/evaluation-model",
+            key,
+            payload,
+            extra_headers={
+                "ai-gateway-protocol-version": "0.0.1",
+                "ai-gateway-auth-method": "api-key",
+                "ai-evaluation-model-specification-version": "4",
+                "ai-model-id": model,
+            },
+        )
+        answers = result.get("answers") or {}
+        # Normalize choice answers that omit confidence.
+        normalized = {
+            qid: normalize_choice_answer(ans) if isinstance(ans, dict) else ans
+            for qid, ans in answers.items()
+        }
+        usage = result.get("usage") or {}
+        if "input_tokens" not in usage and "inputTokens" in usage:
+            usage = {
+                "input_tokens": usage.get("inputTokens"),
+                "output_tokens": usage.get("outputTokens"),
+                **usage,
+            }
+        return {"model": model, "answers": normalized, "usage": usage, "_vercel": True}, backend
+
+    # typesafe (default)
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "No Jev credentials. Set TYPESAFE_API_KEY, or AI_GATEWAY_API_KEY (vercel), "
+            "or OPENROUTER_API_KEY (openrouter)."
+        )
+    payload = {
+        **body,
+        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+    }
+    return post_json("https://api.typesafe.ai/v1/systemone", key, payload), "typesafe"
 
 
 def action_space(actions):
@@ -104,6 +250,7 @@ def choose(state, goal, history):
             },
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    assert_enabled()
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -116,7 +263,7 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result, backend = jev_decide(body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -141,7 +288,8 @@ def choose(state, goal, history):
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "raw_answers": result["answers"],
-        "model": result["model"],
+        "model": result.get("model"),
+        "backend": backend,
         "usage": result.get("usage", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,

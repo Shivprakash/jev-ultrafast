@@ -130,9 +130,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     load_environment()
+    from .model import assert_enabled, resolve_backend
+
+    try:
+        assert_enabled()
+    except RuntimeError as error:
+        print(f"error: {error}", flush=True)
+        raise SystemExit(2) from error
     atexit.register(close_browser)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Jev Ultrafast: {ORIGIN}", flush=True)
+    print(f"Jev Ultrafast: {ORIGIN}  backend={resolve_backend()}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
