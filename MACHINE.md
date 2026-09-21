@@ -34,13 +34,30 @@ server refuse to start.
 
 | Value | Key | Notes |
 | --- | --- | --- |
-| openrouter | OPENROUTER_API_KEY | **default on this machine** (works now) |
-| vercel | AI_GATEWAY_API_KEY | needs Vercel AI Gateway credit card / billing unlock |
+| openrouter | OPENROUTER_API_KEY | shared key: `~/.config/lm/secrets/openrouter.key` |
+| vercel | AI_GATEWAY_API_KEY | shared key: `~/.config/lm/secrets/vercel-ai-gateway.key` |
 | typesafe | TYPESAFE_API_KEY | official System One |
 
-If Vercel returns `customer_verification_required`, keep `JEV_BACKEND=openrouter`.
+Jev automatically loads the shared Vercel and OpenRouter key files when the
+corresponding environment variable is empty. Set `JEV_BACKEND=vercel` to use
+Vercel AI Gateway. The repository `.env` may contain only backend/model
+selection; provider key values do not need to be duplicated there.
 
-Text for TYPE_TEXT uses OpenRouter (`TEXT_MODEL_API_KEY`, mercury-2.5).
+Text for TYPE_TEXT uses any OpenAI-compatible endpoint set by
+`TEXT_MODEL_BASE_URL` (default model `inception/mercury-2.5`). If
+`TEXT_MODEL_API_KEY` is empty, the key for that host is reused instead:
+
+| `TEXT_MODEL_BASE_URL` host | Key used |
+| --- | --- |
+| `ai-gateway.vercel.sh` | `AI_GATEWAY_API_KEY` |
+| `openrouter.ai` | `OPENROUTER_API_KEY` |
+| `api.openai.com` | `OPENAI_API_KEY` |
+| `api.deepseek.com` | `DEEPSEEK_API_KEY` |
+| `api.typesafe.ai` | `TYPESAFE_API_KEY` |
+
+So a provider key never has to be duplicated into `.env`. Without this,
+TYPE_TEXT fails and every goal that needs typing dies mid-run, while
+click-only goals still succeed — a confusing partial failure.
 
 ## Browser
 

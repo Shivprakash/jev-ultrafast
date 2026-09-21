@@ -151,8 +151,38 @@ def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     assert sent["goal"] == 'Fly from "Zurich" to London'
 
 
-def test_missing_text_credential_stops_before_guessing(monkeypatch):
+def clear_text_credentials(monkeypatch):
     monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
+    for variable in model.TEXT_MODEL_KEY_VARIABLES.values():
+        monkeypatch.delenv(variable, raising=False)
+
+
+def test_missing_text_credential_stops_before_guessing(monkeypatch):
+    clear_text_credentials(monkeypatch)
+    with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
+        model.field_text({"goal": 'Enter "Zurich"'})
+
+
+def test_text_key_falls_back_to_the_provider_key_for_that_host(monkeypatch):
+    clear_text_credentials(monkeypatch)
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://ai-gateway.vercel.sh/v1")
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "gateway-key")
+    assert model.text_model_key(model.text_model_base()) == ("gateway-key", "AI_GATEWAY_API_KEY")
+
+
+def test_explicit_text_key_wins_over_the_provider_key(monkeypatch):
+    clear_text_credentials(monkeypatch)
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-key")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "explicit-key")
+    assert model.text_model_key(model.text_model_base()) == ("explicit-key", "TEXT_MODEL_API_KEY")
+
+
+def test_unknown_text_host_reports_only_the_explicit_variable(monkeypatch):
+    clear_text_credentials(monkeypatch)
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://llm.internal.example/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-key")
+    assert model.text_model_key(model.text_model_base()) == ("", None)
     with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
         model.field_text({"goal": 'Enter "Zurich"'})
 
