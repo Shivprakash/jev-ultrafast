@@ -14,6 +14,7 @@ import math
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -21,6 +22,60 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 BROWSER_STATE_PATH = Path.home() / ".config" / "lm" / "jev" / "browser.json"
+SHARED_SECRET_DIR = Path.home() / ".config" / "lm" / "secrets"
+
+DEFAULT_TEXT_MODEL_BASE = "https://api.deepseek.com/v1"
+
+# TEXT_MODEL_BASE_URL is any OpenAI-compatible endpoint. When no dedicated
+# TEXT_MODEL_API_KEY is set, reuse the provider key already on the machine for
+# that host rather than duplicating a secret into the repository .env.
+TEXT_MODEL_KEY_VARIABLES = {
+    "openrouter.ai": "OPENROUTER_API_KEY",
+    "api.openai.com": "OPENAI_API_KEY",
+    "ai-gateway.vercel.sh": "AI_GATEWAY_API_KEY",
+    "api.deepseek.com": "DEEPSEEK_API_KEY",
+    "api.typesafe.ai": "TYPESAFE_API_KEY",
+}
+
+
+def text_model_base():
+    return os.environ.get("TEXT_MODEL_BASE_URL", DEFAULT_TEXT_MODEL_BASE).rstrip("/")
+
+
+def text_model_key(base):
+    """Return (key, source_variable) for the TYPE_TEXT writer model.
+
+    An explicit TEXT_MODEL_API_KEY always wins. Otherwise fall back to the
+    provider key matching the configured host, which load_shared_gateway_credentials
+    may itself have hydrated from ~/.config/lm/secrets.
+    """
+    explicit = os.environ.get("TEXT_MODEL_API_KEY", "").strip()
+    if explicit:
+        return explicit, "TEXT_MODEL_API_KEY"
+    variable = TEXT_MODEL_KEY_VARIABLES.get(urlsplit(base).hostname or "")
+    if variable:
+        return os.environ.get(variable, "").strip(), variable
+    return "", None
+
+
+def load_shared_gateway_credentials():
+    """Use the shared lm gateway secrets when dotenv leaves keys empty."""
+    mappings = {
+        "AI_GATEWAY_API_KEY": SHARED_SECRET_DIR / "vercel-ai-gateway.key",
+        "OPENROUTER_API_KEY": SHARED_SECRET_DIR / "openrouter.key",
+    }
+    for variable, path in mappings.items():
+        if os.environ.get(variable, "").strip():
+            continue
+        try:
+            value = path.read_text(encoding="utf-8").splitlines()[0].strip()
+        except (OSError, IndexError):
+            continue
+        if value:
+            os.environ[variable] = value
+
+
+load_shared_gateway_credentials()
 
 
 def assert_enabled():
@@ -306,10 +361,13 @@ def field_context(goal, action, page, history):
 
 
 def field_text(context):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
+    base = text_model_base()
+    key, source = text_model_key(base)
     if not key:
-        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+        wanted = f"TEXT_MODEL_API_KEY or {source}" if source else "TEXT_MODEL_API_KEY"
+        raise ValueError(
+            f"TYPE_TEXT needs {wanted} for {base}; no text is hardcoded or guessed by the executor."
+        )
     model = os.environ.get("TEXT_MODEL", "deepseek-chat")
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
