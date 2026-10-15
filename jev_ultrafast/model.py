@@ -1,9 +1,17 @@
 """TypeSafe/Jev makes choices; an optional small OpenAI-compatible model writes field values.
 
 Backends (JEV_BACKEND):
-  typesafe  — https://api.typesafe.ai/v1/systemone (TYPESAFE_API_KEY)
-  openrouter — OpenRouter Decisions API (OPENROUTER_API_KEY)
-  vercel — Vercel AI Gateway evaluation model (AI_GATEWAY_API_KEY)
+  typesafe      — https://api.typesafe.ai/v1/systemone (TYPESAFE_API_KEY)
+  openrouter    — OpenRouter Decisions API (OPENROUTER_API_KEY)
+  vercel        — Vercel AI Gateway evaluation model (AI_GATEWAY_API_KEY)
+  mithila-clef  — local Clef SystemOne (MITHILA_CLEF_BASE_URL, default gana004:8003)
+
+TYPE_TEXT uses TEXT_MODEL_BASE_URL / TEXT_MODEL (any OpenAI-compatible chat
+endpoint). Lab default for local runs is mithila-chat on gana005:8000.
+
+Switch selection without losing cloud values:
+  uv run python scripts/backend_preset.py apply mithila-local|cloud
+  uv run python scripts/backend_preset.py restore
 
 Machine kill switch: ~/.config/lm/jev/browser.json enabled flag, or
 JEV_ULTRAFAST_ENABLED=0|1. Managed by `lm fleet jev-browser on|off`.
@@ -25,6 +33,11 @@ BROWSER_STATE_PATH = Path.home() / ".config" / "lm" / "jev" / "browser.json"
 SHARED_SECRET_DIR = Path.home() / ".config" / "lm" / "secrets"
 
 DEFAULT_TEXT_MODEL_BASE = "https://api.deepseek.com/v1"
+DEFAULT_MITHILA_CLEF_BASE = "http://gana004:8003/v1"
+DEFAULT_MITHILA_CLEF_MODEL = "/home/shivprakash/mithila/models/clef/Clef-Q4_K_M.gguf"
+DEFAULT_MITHILA_CHAT_MODEL = "/home/shivprakash/mithila/models/qwen_chat"
+
+KNOWN_BACKENDS = frozenset({"typesafe", "openrouter", "vercel", "mithila-clef"})
 
 # TEXT_MODEL_BASE_URL is any OpenAI-compatible endpoint. When no dedicated
 # TEXT_MODEL_API_KEY is set, reuse the provider key already on the machine for
@@ -35,6 +48,11 @@ TEXT_MODEL_KEY_VARIABLES = {
     "ai-gateway.vercel.sh": "AI_GATEWAY_API_KEY",
     "api.deepseek.com": "DEEPSEEK_API_KEY",
     "api.typesafe.ai": "TYPESAFE_API_KEY",
+    # Local Spark lab (mithila-chat / vLLM). Placeholder key is enough.
+    "gana005": "TEXT_MODEL_API_KEY",
+    "gana004": "TEXT_MODEL_API_KEY",
+    "127.0.0.1": "TEXT_MODEL_API_KEY",
+    "localhost": "TEXT_MODEL_API_KEY",
 }
 
 
@@ -48,13 +66,25 @@ def text_model_key(base):
     An explicit TEXT_MODEL_API_KEY always wins. Otherwise fall back to the
     provider key matching the configured host, which load_shared_gateway_credentials
     may itself have hydrated from ~/.config/lm/secrets.
+
+    Lab hosts (gana00x / localhost) that still have no key get a non-secret
+    placeholder so local OpenAI-compatible servers without auth still work.
     """
     explicit = os.environ.get("TEXT_MODEL_API_KEY", "").strip()
     if explicit:
         return explicit, "TEXT_MODEL_API_KEY"
-    variable = TEXT_MODEL_KEY_VARIABLES.get(urlsplit(base).hostname or "")
+    host = urlsplit(base).hostname or ""
+    variable = TEXT_MODEL_KEY_VARIABLES.get(host)
     if variable:
-        return os.environ.get(variable, "").strip(), variable
+        value = os.environ.get(variable, "").strip()
+        if value:
+            return value, variable
+        if host in {"gana004", "gana005", "127.0.0.1", "localhost"} or host.endswith(".ts.net"):
+            # Local mithila vLLM/Clef paths do not require a real bearer.
+            return "local", variable
+        return "", variable
+    if host in {"gana004", "gana005", "127.0.0.1", "localhost"} or host.endswith(".ts.net"):
+        return "local", "TEXT_MODEL_API_KEY"
     return "", None
 
 
@@ -63,6 +93,7 @@ def load_shared_gateway_credentials():
     mappings = {
         "AI_GATEWAY_API_KEY": SHARED_SECRET_DIR / "vercel-ai-gateway.key",
         "OPENROUTER_API_KEY": SHARED_SECRET_DIR / "openrouter.key",
+        "TYPESAFE_API_KEY": SHARED_SECRET_DIR / "typesafe.key",
     }
     for variable, path in mappings.items():
         if os.environ.get(variable, "").strip():
@@ -163,7 +194,7 @@ def resolve_backend():
     Gateway may require billing verification even with a valid API key.
     """
     explicit = os.environ.get("JEV_BACKEND", "").strip().lower()
-    if explicit in {"typesafe", "openrouter", "vercel"}:
+    if explicit in KNOWN_BACKENDS:
         return explicit
     if os.environ.get("TYPESAFE_API_KEY", "").strip():
         return "typesafe"
@@ -171,7 +202,22 @@ def resolve_backend():
         return "openrouter"
     if os.environ.get("AI_GATEWAY_API_KEY", "").strip():
         return "vercel"
+    if os.environ.get("MITHILA_CLEF_BASE_URL", "").strip():
+        return "mithila-clef"
     return "typesafe"
+
+
+def mithila_clef_base():
+    return os.environ.get("MITHILA_CLEF_BASE_URL", DEFAULT_MITHILA_CLEF_BASE).rstrip("/")
+
+
+def mithila_clef_model():
+    return os.environ.get("MITHILA_CLEF_MODEL", DEFAULT_MITHILA_CLEF_MODEL)
+
+
+def mithila_clef_key():
+    """Bearer for local Clef. Empty becomes a non-secret placeholder."""
+    return os.environ.get("MITHILA_CLEF_API_KEY", "").strip() or "local"
 
 
 def jev_decide(body):
@@ -232,12 +278,24 @@ def jev_decide(body):
             }
         return {"model": model, "answers": normalized, "usage": usage, "_vercel": True}, backend
 
+    if backend == "mithila-clef":
+        # Local Clef exposes TypeSafe-compatible /v1/systemone. Model id is the
+        # served GGUF path; auth is optional on the lab boxes.
+        base = mithila_clef_base()
+        model_id = mithila_clef_model()
+        payload = {**body, "model": model_id}
+        result = post_json(f"{base}/systemone", mithila_clef_key(), payload)
+        if "model" not in result:
+            result = {**result, "model": model_id}
+        return result, backend
+
     # typesafe (default)
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if not key:
         raise RuntimeError(
-            "No Jev credentials. Set TYPESAFE_API_KEY, or AI_GATEWAY_API_KEY (vercel), "
-            "or OPENROUTER_API_KEY (openrouter)."
+            "No Jev credentials. Set TYPESAFE_API_KEY, AI_GATEWAY_API_KEY (vercel), "
+            "OPENROUTER_API_KEY (openrouter), or JEV_BACKEND=mithila-clef with "
+            "MITHILA_CLEF_BASE_URL."
         )
     payload = {
         **body,
@@ -368,28 +426,35 @@ def field_text(context):
         raise ValueError(
             f"TYPE_TEXT needs {wanted} for {base}; no text is hardcoded or guessed by the executor."
         )
-    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
+    host = urlsplit(base).hostname or ""
+    default_model = (
+        DEFAULT_MITHILA_CHAT_MODEL
+        if host in {"gana004", "gana005", "127.0.0.1", "localhost"} or host.endswith(".ts.net")
+        else "deepseek-chat"
+    )
+    model = os.environ.get("TEXT_MODEL", default_model)
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    # Local Qwen/vLLM often emits chain-of-thought before JSON; keep the body lean.
+    if host in {"gana004", "gana005", "127.0.0.1", "localhost"} or host.endswith(".ts.net"):
+        reasoning = {}
     started = time.perf_counter()
-    result = post_json(
-        base + "/chat/completions",
-        key,
-        {
-            "model": model,
-            "max_tokens": 1024,
-            "response_format": {"type": "json_object"},
-            **reasoning,
-            "messages": [
-                {"role": "system", "content": TEXT_VALUE},
-                {
-                    "role": "user",
-                    "content": json.dumps(context),
-                },
-            ],
-        },
-    )
+    body = {
+        "model": model,
+        "max_tokens": 1024,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": TEXT_VALUE},
+            {
+                "role": "user",
+                "content": json.dumps(context),
+            },
+        ],
+    }
+    body.update(reasoning)
+    result = post_json(base + "/chat/completions", key, body)
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
         value = output["text"]
