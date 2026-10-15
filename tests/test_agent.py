@@ -3,6 +3,7 @@
 import json
 import time
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -185,6 +186,92 @@ def test_unknown_text_host_reports_only_the_explicit_variable(monkeypatch):
     assert model.text_model_key(model.text_model_base()) == ("", None)
     with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
         model.field_text({"goal": 'Enter "Zurich"'})
+
+
+def test_resolve_backend_accepts_mithila_clef(monkeypatch):
+    monkeypatch.setenv("JEV_BACKEND", "mithila-clef")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    assert model.resolve_backend() == "mithila-clef"
+
+
+def test_mithila_clef_posts_systemone(monkeypatch):
+    calls = []
+
+    def post(url, key, body, extra_headers=None):
+        calls.append({"url": url, "key": key, "body": body, "extra_headers": extra_headers})
+        return {
+            "model": body["model"],
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(["1", "2"], "2"),
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        }
+
+    monkeypatch.setenv("JEV_BACKEND", "mithila-clef")
+    monkeypatch.setenv("MITHILA_CLEF_BASE_URL", "http://gana004:8003/v1")
+    monkeypatch.setenv(
+        "MITHILA_CLEF_MODEL", "/home/shivprakash/mithila/models/clef/Clef-Q4_K_M.gguf"
+    )
+    monkeypatch.setenv("MITHILA_CLEF_API_KEY", "local")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Click Go", [])
+    assert d["backend"] == "mithila-clef"
+    assert d["operation"] == "CLICK" and d["choice"] == "e3"
+    assert calls[0]["url"] == "http://gana004:8003/v1/systemone"
+    assert calls[0]["key"] == "local"
+    assert calls[0]["body"]["model"].endswith("Clef-Q4_K_M.gguf")
+
+
+def test_local_mithila_chat_text_key_placeholder(monkeypatch):
+    clear_text_credentials(monkeypatch)
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "http://gana005:8000/v1")
+    monkeypatch.setenv("TEXT_MODEL", "/home/shivprakash/mithila/models/qwen_chat")
+    key, source = model.text_model_key(model.text_model_base())
+    assert key == "local" and source == "TEXT_MODEL_API_KEY"
+    post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    value, meta = model.field_text({"goal": 'Enter "Zurich"'})
+    assert value == "Zurich"
+    assert meta["model"] == "/home/shivprakash/mithila/models/qwen_chat"
+    assert post.call_args.args[0] == "http://gana005:8000/v1/chat/completions"
+    assert post.call_args.args[1] == "local"
+    assert "reasoning" not in post.call_args.args[2]
+    assert post.call_args.args[2]["temperature"] == 0
+
+
+def test_backend_preset_round_trip(tmp_path, monkeypatch):
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "backend_preset.py"
+    spec = importlib.util.spec_from_file_location("backend_preset", script)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "JEV_BACKEND=typesafe\nTYPESAFE_MODEL=jev-latest\n"
+        "TEXT_MODEL_BASE_URL=https://ai-gateway.vercel.sh/v1\n"
+        "TEXT_MODEL=inception/mercury-2.5\nTYPESAFE_API_KEY=keep-me\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "ENV_PATH", env_path)
+    monkeypatch.setattr(mod, "SNAPSHOT", tmp_path / "restore.env")
+    monkeypatch.setattr(mod, "STATE_DIR", tmp_path)
+
+    assert mod.main(["apply", "mithila-local"]) == 0
+    text = env_path.read_text(encoding="utf-8")
+    assert "JEV_BACKEND=mithila-clef" in text
+    assert "TEXT_MODEL=/home/shivprakash/mithila/models/qwen_chat" in text
+    assert "TYPESAFE_API_KEY=keep-me" in text
+    assert mod.SNAPSHOT.is_file()
+
+    assert mod.main(["restore"]) == 0
+    restored = env_path.read_text(encoding="utf-8")
+    assert "JEV_BACKEND=typesafe" in restored
+    assert "TEXT_MODEL=inception/mercury-2.5" in restored
+    assert "TYPESAFE_API_KEY=keep-me" in restored
 
 
 @pytest.fixture
